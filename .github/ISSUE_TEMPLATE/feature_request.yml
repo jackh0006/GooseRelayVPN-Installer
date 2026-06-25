@@ -1,0 +1,8 @@
+name: Feature Request
+
+description: Suggest a feature
+
+body:
+  - type: textarea
+    attributes:
+      label: Feature Description
