@@ -1,0 +1,12 @@
+name: Bug Report
+
+description: Report a bug
+
+body:
+  - type: textarea
+    attributes:
+      label: Description
+
+  - type: textarea
+    attributes:
+      label: Logs
