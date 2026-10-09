@@ -4,7 +4,6 @@ set -Eeuo pipefail
 # GooseForge - guided GooseRelayVPN server installer and manager.
 # Target: Debian/Ubuntu VPS with systemd.
 
-APP_NAME="GooseForge"
 PROJECT_URL="https://github.com/Kianmhz/GooseRelayVPN"
 DEFAULT_DOWNLOAD_URL="https://github.com/Kianmhz/GooseRelayVPN/releases/download/v1.7.1/GooseRelayVPN-server-v1.7.1-linux-amd64.tar.gz"
 # Pinned SHA-256 of the default upstream tarball (verify on the upstream
@@ -25,7 +24,6 @@ MANAGED_END="# END GooseForge managed GooseRelayVPN"
 RED=$'\033[31m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
-BLUE=$'\033[34m'
 MAGENTA=$'\033[35m'
 CYAN=$'\033[36m'
 BOLD=$'\033[1m'
