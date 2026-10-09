@@ -7,6 +7,9 @@ set -Eeuo pipefail
 APP_NAME="GooseForge"
 PROJECT_URL="https://github.com/Kianmhz/GooseRelayVPN"
 DEFAULT_DOWNLOAD_URL="https://github.com/Kianmhz/GooseRelayVPN/releases/download/v1.7.1/GooseRelayVPN-server-v1.7.1-linux-amd64.tar.gz"
+# Pinned SHA-256 of the default upstream tarball (verify on the upstream
+# release page before changing; override per-run with GOOSE_SHA256=...).
+DEFAULT_DOWNLOAD_SHA256="7917f68357bdb745ef058f8c7b01921eeb7ee4079cd8a7040108622cb29eb260"
 
 STATE_DIR="/etc/gooseforge"
 STATE_FILE="${STATE_DIR}/state.conf"
@@ -544,6 +547,14 @@ download_and_install_goose() {
   tarball="${workdir}/$(basename "$url")"
 
   run_step "Downloading GooseRelayVPN server with wget" sudo wget -O "$tarball" "$url"
+  if [[ "$url" == "$DEFAULT_DOWNLOAD_URL" ]]; then
+    run_step "Verifying upstream tarball SHA-256" bash -c "echo '${GOOSE_SHA256:-$DEFAULT_DOWNLOAD_SHA256}  $tarball' | sha256sum -c -"
+  elif [[ -n "${GOOSE_SHA256:-}" ]]; then
+    run_step "Verifying custom tarball SHA-256" bash -c "echo '${GOOSE_SHA256}  $tarball' | sha256sum -c -"
+  else
+    fail "Custom download URL needs GOOSE_SHA256 set (refusing unverified binary). Rerun with: sudo GOOSE_SHA256=<sha256> bash $0"
+    return 1
+  fi
   run_step "Testing archive integrity" tar -tzf "$tarball"
 
   tar -tzf "$tarball" > "${workdir}/archive.list"
@@ -639,7 +650,9 @@ health_check() {
   fi
 
   if command_exists curl; then
-    code="$(curl -k -m 8 -s -o /tmp/gooseforge-health.out -w '%{http_code}' "$url" || true)"
+    # No -k: HTTPS health checks must verify TLS (a bad cert is a finding,
+    # not something to click through). Plain-HTTP loopback needs no TLS.
+    code="$(curl -m 8 -s -o /tmp/gooseforge-health.out -w '%{http_code}' "$url" || true)"
     if [[ "$code" =~ ^[234][0-9][0-9]$ ]]; then
       ok "HTTP test reached GooseRelayVPN: ${url} returned HTTP ${code}."
       sed 's/^/  /' /tmp/gooseforge-health.out 2>/dev/null || true
