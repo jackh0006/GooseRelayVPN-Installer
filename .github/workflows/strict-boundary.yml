@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+name: Strict boundary
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  strict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan
+        run: |
+          grep -rn --exclude-dir=.git -E 'BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY' . --include='*.sh' --include='*.md' --include='*.json' --include='*.yaml' --include='*.yml' && { echo "private key material forbidden"; exit 1; }
+          grep -rniE 'ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}' . --exclude-dir=.git && { echo "token forbidden"; exit 1; }
+          echo "secrets: none found OK"
+      - name: No TLS bypasses, no unverified binaries
+        run: |
+          grep -rn 'curl -k\|wget --no-check-certificate' install.sh && { echo "TLS bypass forbidden"; exit 1; }
+          grep -q 'GOOSE_SHA256' install.sh || { echo "upstream SHA pin required"; exit 1; }
+          echo "supply chain: pinned OK"
+      - name: No unverifiable claims
+        run: |
+          grep -rin 'unhackable\|NSA-proof\|zero bugs\|fully undetectable\|guaranteed anonymous\|100% anonymous\|Ultimate.*Toolkit' README.md SECURITY.md PRIVACY.md docs/ install.sh 2>/dev/null | grep -vi 'never\|no \|not \|visible\|honest\|limits' && { echo "hype claim forbidden"; exit 1; }
+          echo "claims: honest OK"

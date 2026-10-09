@@ -7,7 +7,7 @@ GooseRelayVPN Installer
 </h1>
 
 <p align="center">
-The Ultimate GooseRelayVPN Deployment & Management Toolkit
+The Complete GooseRelayVPN Deployment & Management Toolkit
 </p>
 
 <p align="center">
@@ -84,6 +84,21 @@ This installer automates:
 - Firewall configuration
 - Service management
 - Health monitoring
+
+## 🛠 Why this installer — scoreboard
+
+Same goal, reproducible. Legend: ✅ yes · ❌ no · 🔶 partial.
+
+| Need (your words) | This installer | Manual GooseRelayVPN setup | Generic VPS script | How we prove it |
+| --- | :---: | :---: | :---: | --- |
+| 🚀 One command, guided flow | ✅ state machine | ❌ | 🔶 | `install.sh` `install_flow`, `docs/architecture.md` |
+| 🔐 Pinned upstream binary (SHA-256) | ✅ enforced | ❌ on you | ❌ | `GOOSE_SHA256` check in `install.sh` |
+| 🧱 Firewall deny-by-default | ✅ UFW + NAT | ❌ on you | 🔶 | Installer output |
+| 🩺 Health checks that verify TLS | ✅ no `-k` | 🔶 | 🔶 | Health function in `install.sh` |
+| 🕵️ Invisible to providers/DPI | ❌ metadata visible | ❌ | ❌ | `PRIVACY.md` — stated limits |
+| 🔍 Independent audit | 🔶 open, needs audit | — | — | `SECURITY.md` |
+
+What only it does: stateful guided deploys (resume, migration, `comparison.md` vs manual) for GooseRelayVPN with pinned, checksummed binaries. What you need: Debian/Ubuntu VPS, a domain for TLS, realistic expectations (provider sees sizes/timing). Full table: [`docs/comparison.md`](docs/comparison.md). No hype — see `SECURITY.md`.
 
 ---
 

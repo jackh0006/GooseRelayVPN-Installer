@@ -11,5 +11,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
+      - name: Shell syntax
+        run: bash -n install.sh
+      - name: Build canonical assets
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="gooserelayvpn-installer-$VER/" HEAD -o "gooserelayvpn-installer-$VER-linux-all.tar.gz"
+          sha256sum "gooserelayvpn-installer-$VER-linux-all.tar.gz" > "gooserelayvpn-installer-$VER-SHA256SUMS.txt"
       - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gooserelayvpn-installer-*-linux-all.tar.gz
+            gooserelayvpn-installer-*-SHA256SUMS.txt
+          generate_release_notes: true
