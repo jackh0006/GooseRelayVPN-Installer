@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.1.0 — "Smart idempotence + Deployment-ID manager" (2026-10-25)
+Author: jackh0006 <jackh109867@gmail.com>
+
+### Added
+
+- **Smart "already installed?" detection** (v2.1.0 core): before any install/update/redo the installer
+  detects what exists, reports a concise health summary, and offers choices with a recommendation.
+  - **Client flows**: Keep (default if valid) / Update binary+scripts / Redo (timestamped .bak first)
+  - **Server flows**: Keep (default) / Update binary only / Replace TLS parts / Full redo (explicit key-preservation warning)
+  - **Apps Script helper**: truly idempotent — same relay URL = "nothing to change"; different URL = backup + overwrite
+- **Deployment-ID manager** (Client menu → `3) Manage deployment IDs`):
+  - Works with any count (1, 2, 3, 4... deployments)
+  - Add: AKfycb... (~70-char validated like the real client), auto-suggests account labels (acct-b, acct-c…), refuses duplicates
+  - Remove: never the last one (client needs ≥1), numbered multi-select, .bak before change
+  - Rename: pick by number, new label
+  - List: masked IDs (`AKfycb…last6`) + account labels
+  - Smart quota advice: same account = shared 20k/day bucket; different account = doubled quota + failover
+  - Optional immediate Client test to verify tunnel with new IDs
+  - All edits via python3 with pre-change backups, full JSON validation, DUP/LAST/BADIDX guards
+- **Server smart idempotence** in `install_flow` and Full installation:
+  - Detects existing service/binary/config/key/HAProxy block/state
+  - Key preservation prompt on full redo (new key BREAKS clients; default = preserve)
+- **Key safety**: `GOOSE_PRESERVE_KEY` guard in `download_and_install_goose`; redo warns loudly that a new key breaks existing clients
+- **Client redo** always backs up config as `client_config.json.bak.TIMESTAMP`
+
+### Changed
+
+- `client_common_install` rewritten to smart fresh/keep/update/redo path
+- `apps_script_flow` idempotent Code.gs (same-URL check, .bak before overwrite)
+- `README.md` rewritten for v2.1.0 features (smart idempotence, deployment manager, server smarts)
+- `CHANGELOG.md` v2.1.0 entry
+
+### Kept
+
+- All v2.0.0 features: Full installation, Server, Client (Linux amd64 + Android arm64), Apps Script, Test (server/client), Doctor, IPv4-only, Status, Advanced, Uninstall
+- Byte-identical parity of generated scripts with live proven versions
+- Complete GooseForge v1 server stack compatibility (state file, HAProxy managed block)
+- v1.7.1 upstream binaries; official Code.gs with anti-loop guard
+
 ## v2.0.0 — "Full installer" (2026-10-24)
 Author: jackh0006 <jackh109867@gmail.com>
 

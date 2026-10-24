@@ -8,6 +8,7 @@ set -Eeuo pipefail
 #    1)  Full installation : server + Apps Script + both clients
 #    2)  Server install    : VPS (Linux amd64) - goose-server + HAProxy TLS
 #    3)  Client install    : Linux amd64 + Android arm64 (Termux-ready)
+#        + Manage deployment IDs (add / remove / list - 1, 2, 3, 4... any count)
 #    4)  Apps Script       : working Code.gs + 5-step deployment guide
 #    5)  Test              : server test / client test
 #    6)  Doctor            : one-key health diagnosis
@@ -15,6 +16,11 @@ set -Eeuo pipefail
 #    8)  Status    9) Advanced    10) Uninstall
 #
 #  Every submenu has:  b) Back   and   0) Exit.
+#
+#  * SMART IDEMPOTENCE (v2.1.0): before changing anything the installer
+#    detects what is already installed, reports it, and offers the choice
+#    with a recommendation (keep / refresh / redo). Existing tunnel keys
+#    are never silently replaced.
 #
 #  * The server side stays 100% compatible with GooseForge v1 (same
 #    state file, same HAProxy managed block) - safe to run again on a
@@ -28,7 +34,7 @@ set -Eeuo pipefail
 #  License: MIT - see LICENSE
 # =====================================================================
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 APP="GooseForge"
 AUTHOR="jackh0006 <jackh109867@gmail.com>"
 PROJECT_URL="https://github.com/Kianmhz/GooseRelayVPN"
@@ -104,6 +110,15 @@ valid_tunnel_key()    { printf '%s' "$1" | grep -qE '^[0-9a-f]{64}$'; }
 valid_host_ip()       { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 valid_relay_url()     { [[ "$1" =~ ^https?://[A-Za-z0-9._~%-]+(:[0-9]{1,5})?/tunnel/?$ ]]; }
 command_exists()      { command -v "$1" >/dev/null 2>&1; }
+
+in_list() { # in_list <value> <list...> — rc 0 when value appears in the list
+  local want="$1" x
+  shift || true
+  for x in "$@"; do
+    if [[ "$x" == "$want" ]]; then return 0; fi
+  done
+  return 1
+}
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -215,11 +230,16 @@ probe_edges() {
 }
 
 client_state_save() { # client_state_save <home>
+  local depn="${#DEP_IDS[@]}" n
+  if [[ $depn -eq 0 && -f "$1/client_config.json" ]] && command_exists python3; then
+    n="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("script_keys",[])))' "$1/client_config.json" 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] && depn="$n"
+  fi
   {
     echo "CLIENT_LABEL=\"${CLIENT_LABEL:-}\""
     echo "CLIENT_GOOGLE_HOST=\"${EDGE_PICKED:-}\""
     echo "CLIENT_RELAY_URL=\"${RELAY_URL:-}\""
-    echo "CLIENT_DEPLOYMENTS=\"${#DEP_IDS[@]}\""
+    echo "CLIENT_DEPLOYMENTS=\"${depn}\""
     echo "CLIENT_INSTALLED_AT=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
   } > "$1/.gooseforge-state"
 }
@@ -634,7 +654,21 @@ apps_script_flow() { # standalone helper: menu item 4
   ask_line d "Save Code.gs to [${dest}] (0 = cancel): "
   if [[ "$d" == "0" ]]; then info "Cancelled."; return 0; fi
   dest="${d:-$dest}"
-  write_code_gs "$dest" "$RELAY_URL"
+  # v2.1.0 idempotence: only write when the relay URL actually differs
+  if [[ -f "$dest" ]] && grep -qF "'${RELAY_URL}'" "$dest" 2>/dev/null && grep -q "RELAY_URLS" "$dest"; then
+    ok "Code.gs already contains exactly this relay URL - nothing to change (kept as is)."
+  else
+    if [[ -f "$dest" ]]; then
+      warn "Existing Code.gs found with DIFFERENT relay URL (or placeholder)."
+      if ! ask_yes_no "Overwrite it (a timestamped .bak backup is made first)?"; then
+        info "Cancelled - your Code.gs was NOT touched. You can also pick another path."
+        return 0
+      fi
+      cp -f "$dest" "${dest}.bak.$(date +%Y%m%d-%H%M%S)"
+      ok "Backup made: ${dest}.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
+    write_code_gs "$dest" "$RELAY_URL"
+  fi
   apps_script_walkthrough "$dest"
 
   # If a client config exists, offer to add this deployment to it directly.
@@ -685,6 +719,14 @@ GF_PY_ADD
       else
         fail "Deployment ID invalid or cancelled - nothing was changed."
       fi
+    fi
+  fi
+
+  # v2.1.0: offer the full deployment-ID manager (list/add/remove/rename)
+  find_client_configs
+  if [[ "${#CONFIG_PATHS[@]}" -gt 0 ]] && command_exists python3; then
+    if ask_yes_no "Open the deployment-ID manager (add/remove more IDs) now?"; then
+      deployment_manager_menu || true
     fi
   fi
   pause
@@ -766,11 +808,108 @@ collect_key() { # fills global CLIENT_KEY
 #  CLIENT INSTALL — engine (linux + phone share ONE code path)
 # =====================================================================
 
-client_common_install() { # <home> <label> <url>
-  local home="$1" label="$2" url="$3"
-  local tarball extract bin tmp
-  mkdir -p "$home"
+# =====================================================================
+#  SMART "ALREADY INSTALLED?" DETECTION (v2.1.0)
+# =====================================================================
 
+EXIST_HEALTHY=0
+EXIST_ACTION=""
+
+describe_client_folder() { # describe_client_folder <home>  — sets EXIST_HEALTHY
+  local home="$1" valid=0 depn="?" edge="?" have_bin=0 running="no" slabel="" sat="" sag=""
+  EXIST_HEALTHY=0
+  if [[ ! -f "$home/client_config.json" && ! -x "$home/goose-client" ]]; then
+    return 1   # brand-new folder, nothing to report
+  fi
+  [[ -x "$home/goose-client" ]] && have_bin=1
+  if [[ -f "$home/.gooseforge-state" ]]; then
+    # shellcheck disable=SC1090
+    source "$home/.gooseforge-state"
+    slabel="${CLIENT_LABEL:-}"; sat="${CLIENT_INSTALLED_AT:-}"; sag="${CLIENT_GOOGLE_HOST:-}"
+    CLIENT_LABEL=""
+  fi
+  if command_exists python3 && [[ -f "$home/client_config.json" ]]; then
+    local pyout
+    if pyout="$(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+ks = c.get("script_keys", [])
+ok = (c.get("socks_port") == 1080 and len(c.get("tunnel_key") or "") == 64 and len(ks) >= 1)
+good = sum(1 for k in ks if isinstance(k.get("id"), str) and len(k.get("id", "")) >= 60)
+print(("OK" if ok and good >= 1 else "BAD"), len(ks), c.get("google_host", "?"))
+' "$home/client_config.json" 2>/dev/null)" && [[ "$pyout" == OK* ]]; then
+      valid=1
+      depn="$(printf '%s' "$pyout" | awk '{print $2}')"
+      edge="$(printf '%s' "$pyout" | awk '{print $3}')"
+    fi
+  elif [[ -f "$home/client_config.json" ]]; then
+    if grep -q '"tunnel_key"' "$home/client_config.json"; then
+      valid=1
+      depn="$(grep -c '"id"' "$home/client_config.json" 2>/dev/null || echo 1)"
+    fi
+  fi
+  if command_exists ss && ss -tln 2>/dev/null | grep -q ":1080 "; then
+    running="YES (something is LISTENING on 1080)"
+  elif command_exists pgrep && pgrep -x goose-client >/dev/null 2>&1; then
+    running="YES"
+  fi
+  if [[ $have_bin -eq 1 && $valid -eq 1 ]]; then EXIST_HEALTHY=1; fi
+
+  warn "This folder was installed before:"
+  printf "        binary   : %s\n" "$([[ $have_bin -eq 1 ]] && echo present || echo MISSING)"
+  if [[ -f "$home/client_config.json" ]]; then
+    if [[ $valid -eq 1 ]]; then
+      printf "        config   : VALID (%s deployment(s), edge %s, tunnel key present)\n" "$depn" "$edge"
+    else
+      printf "        config   : present but INVALID/BROKEN\n"
+    fi
+  else
+    printf "        config   : MISSING\n"
+  fi
+  printf "        scripts  : %s\n" "$([[ -x $home/start-goose.sh && -x $home/stop-goose.sh ]] && echo present || echo missing/some)"
+  [[ -n "$sat" ]] && printf "        installed: %s (%s)\n" "$sat" "${slabel:-?}"
+  printf "        running  : %s\n" "$running"
+  return 0
+}
+
+client_existing_menu() { # client_existing_menu <home>  — sets EXIST_ACTION (keep|update|redo) or returns 1 on cancel
+  local home="$1" choice
+  if ! describe_client_folder "$home"; then
+    return 1
+  fi
+  local defrec=1
+  if [[ $EXIST_HEALTHY -eq 1 ]]; then
+    printf "\n 1) Keep everything - install ONLY what is missing %s(kept config + key, RECOMMENDED)%s\n" "$GREEN" "$RESET"
+    printf " 2) Refresh binary + scripts (my config and tunnel key stay untouched)\n"
+    printf " 3) Redo from scratch %s(old config saved as client_config.json.bak... first)%s\n" "$DIM" "$RESET"
+  else
+    warn "This existing install is BROKEN or INCOMPLETE - a redo is the safe choice."
+    printf "\n 1) Keep and fill in ONLY what is missing\n"
+    printf " 2) Refresh binary + scripts (my config and tunnel key stay untouched)\n"
+    printf " 3) Redo from scratch %s(RECOMMENDED - old config backed up first)%s\n" "$GREEN" "$RESET"
+    defrec=3
+  fi
+  if command_exists ss && ss -tln 2>/dev/null | grep -q ":1080 "; then
+    warn "Note: port 1080 is busy - stop the client (./stop-goose.sh) before updating/redone here."
+  fi
+  printf " 0) Cancel\n\n"
+  while true; do
+    ask_line choice "Choice [${defrec}]: "
+    choice="${choice:-$defrec}"
+    case "$choice" in
+      1) EXIST_ACTION="keep"; return 0 ;;
+      2) EXIST_ACTION="update"; return 0 ;;
+      3) EXIST_ACTION="redo"; return 0 ;;
+      0) info "Cancelled."; return 1 ;;
+      *) warn "Invalid choice (1-3 or 0)." ;;
+    esac
+  done
+}
+
+client_refresh_binary() { # client_refresh_binary <home> <label> <url>
+  local home="$1" label="$2" url="$3"
+  local tarball extract bin
+  mkdir -p "$home"
   tarball="$(mktemp)"
   if ! run_step "Downloading client archive (${RELAY_RELEASE} ${label})" fetch "$url" "$tarball"; then
     rm -f "$tarball"
@@ -787,7 +926,6 @@ client_common_install() { # <home> <label> <url>
     return 1
   fi
   rm -f "$tarball"
-
   bin="$(find "$extract" -maxdepth 3 -type f -name 'goose-client' | head -n 1)"
   if [[ -z "$bin" ]]; then
     fail "goose-client binary not found inside the archive."
@@ -799,43 +937,105 @@ client_common_install() { # <home> <label> <url>
   chmod 755 "${home}/goose-client"
   rm -rf "$extract"
   ok "Installed binary: ${home}/goose-client"
+  return 0
+}
 
-  # Upgrade path: keep an existing config if there is one (key stays safe).
-  if [[ -f "${home}/client_config.json" ]]; then
-    if ask_yes_no "An existing client_config.json was found - KEEP it (recommended)?"; then
-      ok "Keeping your existing config (tunnel key and deployments untouched)."
-    else
-      if ! collect_deployments; then return 1; fi
-      if ! collect_key; then return 1; fi
-      if [[ -n "${GOOSE_PRED_EDGE:-}" ]]; then
-        EDGE_PICKED="$GOOSE_PRED_EDGE"
-        ok "Google edge preselected: ${EDGE_PICKED}"
-      else
-        probe_edges
-      fi
-      CLIENT_LABEL="$label"
-      write_client_config "$home" "$EDGE_PICKED" "$CLIENT_KEY"
-    fi
+client_fresh_config() { # client_fresh_config <home> <label>
+  local home="$1" label="$2"
+  if ! collect_deployments; then return 1; fi
+  if ! collect_key; then return 1; fi
+  if [[ -n "${GOOSE_PRED_EDGE:-}" ]]; then
+    EDGE_PICKED="$GOOSE_PRED_EDGE"
+    ok "Google edge preselected: ${EDGE_PICKED}"
   else
-    if ! collect_deployments; then return 1; fi
-    if ! collect_key; then return 1; fi
-    if [[ -n "${GOOSE_PRED_EDGE:-}" ]]; then
-      EDGE_PICKED="$GOOSE_PRED_EDGE"
-      ok "Google edge preselected: ${EDGE_PICKED}"
-    else
-      probe_edges
-    fi
-    CLIENT_LABEL="$label"
-    write_client_config "$home" "$EDGE_PICKED" "$CLIENT_KEY"
+    probe_edges
+  fi
+  CLIENT_LABEL="$label"
+  write_client_config "$home" "$EDGE_PICKED" "$CLIENT_KEY"
+  return 0
+}
+
+# preserve a previously recorded relay URL when re-saving client state
+client_state_reload_relay() { # <home> — restore saved relay/edge/label so a re-save keeps them
+  if [[ -f "$1/.gooseforge-state" ]]; then
+    # shellcheck disable=SC1090
+    source "$1/.gooseforge-state"
+    if [[ -z "${RELAY_URL:-}" ]]; then RELAY_URL="${CLIENT_RELAY_URL:-}"; fi
+    if [[ -z "${EDGE_PICKED:-}" ]]; then EDGE_PICKED="${CLIENT_GOOGLE_HOST:-}"; fi
+    CLIENT_RELAY_URL=""
+    CLIENT_GOOGLE_HOST=""
+  fi
+  return 0
+}
+
+client_common_install() { # <home> <label> <url>  — smart: fresh / keep / update / redo
+  local home="$1" label="$2" url="$3"
+  local have_cfg=0 have_bin=0
+  [[ -f "$home/client_config.json" ]] && have_cfg=1
+  [[ -x "$home/goose-client" ]] && have_bin=1
+
+  if [[ $have_cfg -eq 0 && $have_bin -eq 0 ]]; then
+    # Fully fresh install.
+    if ! client_refresh_binary "$home" "$label" "$url"; then return 1; fi
+    if ! client_fresh_config "$home" "$label"; then return 1; fi
+    write_start_script "$home"
+    write_stop_script "$home"
+    write_guide "$home"
+    client_state_reload_relay "$home"
+    client_state_save "$home"
+  else
+    EXIST_ACTION="keep"
+    if ! client_existing_menu "$home"; then return 1; fi
+    case "$EXIST_ACTION" in
+      keep)
+        ok "KEPT. Installing only what is missing (nothing existing was changed):"
+        if [[ $have_bin -eq 0 ]]; then
+          if ! client_refresh_binary "$home" "$label" "$url"; then return 1; fi
+        else
+          ok "binary: already present - untouched"
+        fi
+        if [[ ! -f "$home/start-goose.sh" ]]; then write_start_script "$home"; ok "created start-goose.sh (was missing)"; else ok "start-goose.sh: present - untouched"; fi
+        if [[ ! -f "$home/stop-goose.sh" ]]; then write_stop_script "$home"; ok "created stop-goose.sh (was missing)"; else ok "stop-goose.sh: present - untouched"; fi
+        if [[ ! -f "$home/GUIDE.txt" ]]; then write_guide "$home"; ok "created GUIDE.txt (was missing)"; else ok "GUIDE.txt: present - untouched"; fi
+        if [[ $have_cfg -eq 0 ]]; then
+          warn "config was missing - collecting what a fresh config needs:"
+          if ! client_fresh_config "$home" "$label"; then return 1; fi
+        else
+          ok "client_config.json: kept exactly as it was"
+        fi
+        client_state_reload_relay "$home"
+        client_state_save "$home"
+        ;;
+      update)
+        ok "UPDATING binary + scripts (config and tunnel key untouched):"
+        if ! client_refresh_binary "$home" "$label" "$url"; then return 1; fi
+        write_start_script "$home"
+        write_stop_script "$home"
+        write_guide "$home"
+        client_state_reload_relay "$home"
+        client_state_save "$home"
+        ;;
+      redo)
+        if [[ -f "$home/client_config.json" ]]; then
+          local bak="${home}/client_config.json.bak.$(date +%Y%m%d-%H%M%S)"
+          cp -f "$home/client_config.json" "$bak"
+          ok "Old config backed up: ${bak}"
+        fi
+        if ! client_refresh_binary "$home" "$label" "$url"; then return 1; fi
+        if ! client_fresh_config "$home" "$label"; then return 1; fi
+        write_start_script "$home"
+        write_stop_script "$home"
+        write_guide "$home"
+        client_state_reload_relay "$home"
+        client_state_save "$home"
+        ;;
+    esac
   fi
 
-  write_start_script "$home"
-  write_stop_script "$home"
-  write_guide "$home"
-  client_state_save "$home"
-
-  # Validate the JSON if python3 exists (best testing available).
-  if command_exists python3; then
+  # Final validation. Hard gate only for fresh/redo; a kept broken config is warn-only.
+  if command_exists python3 && [[ -f "$home/client_config.json" ]]; then
+    local hardfail=1
+    if [[ -n "$EXIST_ACTION" && "$EXIST_ACTION" != "redo" ]]; then hardfail=0; fi
     if ! python3 - "$home/client_config.json" > /dev/null 2>&1 <<'GF_PY_VAL'
 import json, sys
 c = json.load(open(sys.argv[1]))
@@ -845,10 +1045,14 @@ assert len(c["tunnel_key"]) == 64
 print("config JSON valid")
 GF_PY_VAL
     then
-      fail "Generated client_config.json failed validation."
-      return 1
+      if [[ $hardfail -eq 1 ]]; then
+        fail "Generated client_config.json failed validation."
+        return 1
+      fi
+      warn "Kept config still fails deep validation - recommend redo (choice 3)."
+    else
+      ok "Config validated: JSON parses, 1080, 1+ deployments, 64-hex key."
     fi
-    ok "Config validated: JSON parses, 1080, 1+ deployments, 64-hex key."
   fi
 
   chmod 755 "${home}/start-goose.sh" "${home}/stop-goose.sh" "${home}/goose-client" 2>/dev/null || true
@@ -858,6 +1062,8 @@ GF_PY_VAL
   printf "  check :  curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org\n"
   return 0
 }
+
+
 
 client_linux_install() { # menu 3 -> 1
   banner
@@ -1067,6 +1273,8 @@ full_install_flow() {
 
   printf "\n%sFULL INSTALLATION FINISHED.%s\n" "$GREEN" "$RESET"
   printf "Read the printed summaries above - every next step is written in front of you.\n"
+  printf "Later: menu 3 -> 3 lets you add more deployment IDs (3, 4, any count) with\n"
+  printf "backups and validation - no reinstall needed.\n"
   pause
 }
 
@@ -1283,9 +1491,15 @@ download_and_install_goose() {
   sudo chmod 755 "$GOOSE_BIN"
   sudo cp "$config_example" "$GOOSE_CONFIG"
 
-  key="$(openssl rand -hex 32)"
-  printf "%s\n" "$key" | sudo tee "$GOOSE_KEY_FILE" >/dev/null
-  sudo chmod 600 "$GOOSE_KEY_FILE"
+  if [[ "${GOOSE_PRESERVE_KEY:-0}" == "1" && -f "$GOOSE_KEY_FILE" ]]; then
+    key="$(sudo cat "$GOOSE_KEY_FILE" 2>/dev/null || openssl rand -hex 32)"
+    ok "Existing tunnel key PRESERVED (your clients keep working)."
+  else
+    key="$(openssl rand -hex 32)"
+    printf "%s\n" "$key" | sudo tee "$GOOSE_KEY_FILE" >/dev/null
+    sudo chmod 600 "$GOOSE_KEY_FILE"
+    ok "New tunnel key generated."
+  fi
 
   sudo sed -i -E "s|(\"tunnel_key\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")|\1${key}\2|" "$GOOSE_CONFIG"
   if grep -q '"server_host"' "$GOOSE_CONFIG"; then
@@ -1366,9 +1580,162 @@ health_check() {
   fi
 }
 
+# =====================================================================
+#  SERVER SMART DETECTION (v2.1.0) — used by install_flow / full flow
+# =====================================================================
+
+EXIST_SERVER_ACTION=""
+GOOSE_PRESERVE_KEY=0
+
+server_existing_menu() { # server_existing_menu — sets EXIST_SERVER_ACTION; rc 0 = chosen, 1 = cancel
+  load_state
+  local choice defrec=1
+  warn "This machine ALREADY has a GooseRelayVPN server installation:"
+  printf "        service  : %s\n" "$([[ -f $GOOSE_UNIT ]] && echo "unit present ($GOOSE_UNIT)" || echo missing)"
+  printf "        binary   : %s\n" "$([[ -x $GOOSE_BIN ]] && echo "present ($GOOSE_BIN)" || echo MISSING)"
+  printf "        config   : %s\n" "$([[ -f $GOOSE_CONFIG ]] && echo "present ($GOOSE_CONFIG)" || echo MISSING)"
+  printf "        tunnel key: %s\n" "$([[ -f $GOOSE_KEY_FILE ]] && echo "present ($GOOSE_KEY_FILE)" || echo MISSING)"
+  if command_exists systemctl; then
+    if systemctl is-active --quiet goose-relay 2>/dev/null; then
+      printf "        service is RUNNING\n"
+    fi
+  fi
+  [[ -n "${GOOSE_DOMAIN:-}" ]] && printf "        mode: %s for %s (port %s)\n" "${GOOSE_MODE:-http}" "$GOOSE_DOMAIN" "${GOOSE_PUBLIC_PORT:-8443}"
+  printf "\n 1) Keep everything - just show status & health %s(RECOMMENDED - nothing changes)%s\n" "$GREEN" "$RESET"
+  printf " 2) Update the server BINARY only (config + tunnel key untouched)\n"
+  printf " 3) Replace / redo the TLS certificate + domain parts only\n"
+  printf " 4) Full redo from scratch (configs backed up first)\n"
+  printf " 0) Cancel\n\n"
+  while true; do
+    ask_line choice "Choice [1]: "
+    choice="${choice:-1}"
+    case "$choice" in
+      1) EXIST_SERVER_ACTION="keep"; return 0 ;;
+      2) EXIST_SERVER_ACTION="update"; return 0 ;;
+      3) EXIST_SERVER_ACTION="tls"; return 0 ;;
+      4)
+        if ask_yes_no "Trigger warning: should a redo generate a NEW tunnel key? This BREAKS all existing clients (they must re-copy the key). Answer NO to preserve the key."; then
+          GOOSE_PRESERVE_KEY=0
+          warn "REMEMBER: existing clients must get the NEW key from ${GOOSE_KEY_FILE} after redo."
+        else
+          GOOSE_PRESERVE_KEY=1
+        fi
+        EXIST_SERVER_ACTION="redo"
+        return 0
+        ;;
+      0) info "Cancelled."; return 1 ;;
+      *) warn "Invalid choice (1-4 or 0)." ;;
+    esac
+  done
+}
+
+server_tls_only_flow() { # redo JUST the cert + HAProxy parts of an installed server
+  load_state
+  local def="${GOOSE_DOMAIN:-}" domain
+  if [[ -n "$def" ]]; then
+    ask_line domain "TLS domain [current: ${def}] (0 = cancel): "
+    if [[ "$domain" == "0" ]]; then info "Cancelled."; return 1; fi
+    domain="${domain:-$def}"
+  else
+    info "Your state has no domain yet (HTTP mode)."
+    ask_line domain "Domain to use (0 = cancel): "
+    if [[ "$domain" == "0" ]]; then info "Cancelled."; return 1; fi
+    if [[ -z "$domain" ]]; then warn "No domain - nothing to do."; return 1; fi
+  fi
+  if ! valid_domain "$domain"; then
+    fail "Invalid domain."
+    return 1
+  fi
+  if ! command_exists certbot; then
+    run_step "Installing Certbot" bash -c 'sudo apt update && sudo apt install certbot -y'
+  fi
+  GOOSE_DOMAIN="$domain"
+  GOOSE_MODE="tls"
+  GOOSE_PUBLIC_PORT="8443"
+  GOOSE_BACKEND_PORT="9444"
+  GOOSE_SERVER_HOST="127.0.0.1"
+  request_certificate "$domain" || warn "Certificate request failed - I still try to use what exists."
+  build_haproxy_pem "$domain" || return 1
+  configure_haproxy_for_domain "$domain" || return 1
+  # also fix the server config's server_port/host for TLS mode
+  if sudo grep -q '"server_host"' "$GOOSE_CONFIG" 2>/dev/null; then
+    sudo sed -i -E 's|("server_host"[[:space:]]*:[[:space:]]*")[^"]*(")|\1127.0.0.1\2|' "$GOOSE_CONFIG"
+  fi
+  if sudo grep -q '"server_port"' "$GOOSE_CONFIG" 2>/dev/null; then
+    sudo sed -i -E "s|(\"server_port\"[[:space:]]*:[[:space:]]*)[0-9]+|\1${GOOSE_BACKEND_PORT}|" "$GOOSE_CONFIG"
+  fi
+  if sudo systemctl is-active --quiet goose-relay; then
+    run_step "Restarting goose-relay for new backend port" sudo systemctl restart goose-relay
+  fi
+  save_state
+  health_check
+  return 0
+}
+
+update_server_core() { # download fresh server binary, swap it, restart (config/key untouched)
+  load_state
+  local url="${GOOSE_DOWNLOAD_URL:-$SERVER_URL}"
+  local workdir tarball topdir extracted newbin
+  workdir="$(mktemp -d)"
+  tarball="${workdir}/srv.tar.gz"
+  run_step "Downloading server archive" wget -O "$tarball" "$url"
+  run_step "Checking archive" tar -tzf "$tarball"
+  tar -xzf "$tarball" -C "$workdir"
+  topdir="$(awk -F/ 'NF {print $1; exit}' <(tar -tzf "$tarball"))"
+  extracted="${workdir}/${topdir}"
+  [[ -d "$extracted" ]] || extracted="$workdir"
+  newbin="$(find "$extracted" -maxdepth 2 -type f -name 'goose-server' | head -n 1)"
+  if [[ -z "$newbin" ]]; then
+    fail "No goose-server in the archive."
+    rm -rf "$workdir"
+    return 1
+  fi
+  if command_exists systemctl && systemctl is-active --quiet goose-relay; then
+    run_step "Stopping service for update" systemctl stop goose-relay
+  fi
+  cp "$newbin" "$GOOSE_BIN"
+  chmod 755 "$GOOSE_BIN"
+  rm -rf "$workdir"
+  run_step "Starting updated service" systemctl restart goose-relay
+  ok "Server binary updated (config and tunnel key untouched)."
+  return 0
+}
+
 install_flow() {
   load_state
   local domain download_url
+
+  # v2.1.0 smart idempotence: is a server already installed here?
+  if [[ -f "$GOOSE_UNIT" || -x "$GOOSE_BIN" || -f "$GOOSE_CONFIG" ]]; then
+    if ! server_existing_menu; then return 1; fi
+    case "$EXIST_SERVER_ACTION" in
+      keep)
+        info "Keeping the existing server installation unchanged."
+        health_check
+        return 0
+        ;;
+      update)
+        if ! update_server_core; then
+          warn "Update did not finish - your existing server files were not changed."
+          health_check
+        fi
+        return 0
+        ;;
+      tls)
+        server_tls_only_flow
+        return $?
+        ;;
+      redo)
+        warn "Doing a FULL server redo. ${GREEN}Your existing config/key files are backed up first.${RESET}"
+        local ts; ts="$(date +%Y%m%d-%H%M%S)"
+        for f in "$GOOSE_CONFIG" "$GOOSE_KEY_FILE"; do
+          if sudo test -f "$f"; then sudo cp -f "$f" "${f}.bak.${ts}"; fi
+        done
+        # ; falls through to the normal fresh flow below
+        ;;
+    esac
+  fi
+
   GOOSE_DOMAIN=""
   GOOSE_MODE="http"
   GOOSE_PUBLIC_PORT="8443"
@@ -1960,6 +2327,275 @@ uninstall_menu() {
   done
 }
 
+# =====================================================================
+#  DEPLOYMENT-ID MANAGER (v2.1.0) — add / remove / list / rename
+#  Works with any count: 1, 2, 3, 4... IDs in the client config.
+# =====================================================================
+
+CONFIG_PATHS=()
+
+find_client_configs() { # sets CONFIG_PATHS[]
+  CONFIG_PATHS=()
+  local p
+  for p in "$CLIENT_HOME" "$ANDROID_HOME"; do
+    if [[ -f "$p/client_config.json" ]]; then CONFIG_PATHS+=("$p"); fi
+  done
+  for p in "$HOME/Downloads"/GooseRelayVPN-client-*; do
+    if [[ -d "$p" && -f "$p/client_config.json" ]] && ! in_list "$p" "${CONFIG_PATHS[@]+"${CONFIG_PATHS[@]}"}"; then
+      CONFIG_PATHS+=("$p")
+    fi
+  done
+  if [[ -f "$(pwd)/client_config.json" ]] && ! in_list "$(pwd)" "${CONFIG_PATHS[@]+"${CONFIG_PATHS[@]}"}"; then
+    CONFIG_PATHS+=("$(pwd)")
+  fi
+  return 0
+}
+
+mask_id() { # "AKfycbXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" -> "AKfycbXXXXXXXX…XXXXXX"
+  local id="$1"
+  if [[ ${#id} -gt 16 ]]; then
+    printf "%s…%s" "${id:0:12}" "${id: -6}"
+  else
+    printf "%s" "$id"
+  fi
+}
+
+dep_py_run() { # dep_py_run <cfg> <list|add|del|ren> [args...]
+  python3 - "$@" <<'GF_PY_DEP'
+import json, sys
+cfg, cmd = sys.argv[1], sys.argv[2]
+args = sys.argv[3:]
+with open(cfg) as fh:
+    c = json.load(fh)
+
+def save():
+    with open(cfg, "w") as fh:
+        json.dump(c, fh, indent=2, ensure_ascii=False)
+
+ks = c.setdefault("script_keys", [])
+
+if cmd == "list":
+    if not ks:
+        print("EMPTY")
+        sys.exit(0)
+    for i, k in enumerate(ks, 1):
+        ident = k.get("id", "?")
+        mask = (ident[:12] + "\u2026" + ident[-6:]) if len(ident) > 16 else ident
+        print(f"{i}  {mask}  {k.get('account', '?')}")
+elif cmd == "add":
+    dep, acct = args[0], args[1]
+    if any(k.get("id") == dep for k in ks):
+        print("DUP")
+        sys.exit(0)
+    ks.append({"id": dep, "account": acct})
+    save()
+    print(f"ADDED count={len(ks)}")
+elif cmd == "del":
+    idxs = sorted({int(x) for x in args}, reverse=True)
+    if any(1 > i or i > len(ks) for i in idxs):
+        print("BADIDX")
+        sys.exit(1)
+    if len(ks) - len(set(idxs)) < 1:
+        print("LAST")
+        sys.exit(2)
+    for i in idxs:
+        ks.pop(i - 1)
+    save()
+    print(f"DELETED count={len(ks)}")
+elif cmd == "ren":
+    i, new = int(args[0]), args[1]
+    ks[i - 1]["account"] = new
+    save()
+    print("RENAMED")
+GF_PY_DEP
+}
+
+dep_counts() { # dep_counts <cfg> → prints "total distinct"
+  python3 - "$1" <<'GF_PY_CNT'
+import json, sys
+c = json.load(open(sys.argv[1]))
+ks = c.get("script_keys", [])
+labels = {k.get("account", "?") for k in ks}
+print(f"{len(ks)} {len(labels)}")
+GF_PY_CNT
+}
+
+dep_quota_advice() { # dep_quota_advice <cfg>
+  local total distinct
+  read -r total distinct < <(dep_counts "$1" | awk '{print $1" "$2}') 2>/dev/null || true
+  total="${total:-0}"; distinct="${distinct:-0}"
+  if [[ "$total" -eq 0 ]]; then
+    warn "No deployments in this config yet - the client cannot run without one."
+    info "Use 'Add deployment ID(s)' below (or menu 4 for the walkthrough)."
+  elif [[ "$total" -eq 1 ]]; then
+    info "1 deployment - fine. Add a 2nd later (different Google account) to DOUBLE quota."
+  elif [[ "$distinct" -eq 1 ]]; then
+    warn "All ${total} deployments share ONE Google account bucket: 20k calls/day TOTAL."
+    info "For double quota add an ID deployed under a DIFFERENT Google account."
+  else
+    ok "${distinct} different account labels = doubled quota + automatic failover. Great."
+  fi
+  info "Reminder: adding a deployment always needs Deploy -> New deployment (menu 4)."
+}
+
+deployment_manager_menu() {
+  banner
+  menu_title "Manage deployment IDs (add / remove / list - 1, 2, 3, 4...)"
+  find_client_configs
+  if [[ "${#CONFIG_PATHS[@]}" -eq 0 ]]; then
+    info "No client config found on this machine yet."
+    info "Install a client first (menu 3 -> Linux amd64 / Android arm64)."
+    pause
+    return 0
+  fi
+  local i=1 p pick cfg
+  printf "Found client configs:\n"
+  for p in "${CONFIG_PATHS[@]}"; do
+    local cnt
+    cnt="$(dep_counts "$p/client_config.json" 2>/dev/null | awk '{print $1}')"
+    printf "  %s) %-60s (%s deployment(s))\n" "$i" "$p" "${cnt:-?}"
+    i=$((i + 1))
+  done
+  ask_line pick "Which one to manage? [1] (0 = cancel): "
+  if [[ "$pick" == "0" ]]; then info "Cancelled."; pause; return 0; fi
+  pick="${pick:-1}"
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || [[ $pick -lt 1 ]] || [[ $pick -gt ${#CONFIG_PATHS[@]} ]]; then
+    fail "No valid choice - back to menu."
+    pause
+    return 0
+  fi
+  cfg="${CONFIG_PATHS[$((pick - 1))]}"
+  local cfgf="${cfg}/client_config.json"
+  if [[ ! -f "$cfgf" ]]; then
+    fail "Odd: ${cfgf} disappeared - nothing changed."
+    pause
+    return 0
+  fi
+  ok "Managing: ${cfgf}"
+
+  local op add_id add_acct addcnt="0" out
+  while true; do
+    menu_title "Deployments in ${cfgf}"
+    dep_py_run "$cfgf" list > /tmp/gooseforge-dep-list.$$ 2>/dev/null || true
+    if [[ ! -s /tmp/gooseforge-dep-list.$$ ]] || grep -q EMPTY /tmp/gooseforge-dep-list.$$ 2>/dev/null; then
+      warn "(config currently has NO readable deployments - add one, or check the file)"
+    else
+      printf " #   ID (masked)             account\n"
+      sed 's/^/ /' /tmp/gooseforge-dep-list.$$
+    fi
+    rm -f /tmp/gooseforge-dep-list.$$
+    dep_quota_advice "$cfgf"
+    printf "\n 1) List again\n"
+    printf " 2) Add deployment ID(s)  (loop - add as many as you want)\n"
+    printf " 3) Remove deployment(s)\n"
+    printf " 4) Rename an account label\n"
+    printf " 5) Run Client test now (see the tunnel live)\n"
+    printf " b) Back (return to the client menu)\n"
+    printf " 0) Exit\n\n"
+    ask_line op "Choice: "
+    case "$op" in
+      1) : ;;
+      2)
+        if ! command_exists python3; then
+          fail "python3 is needed to edit configs safely."
+          pause
+          continue
+        fi
+        local bak="${cfgf}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -f "$cfgf" "$bak"
+        ok "Backup made: ${bak}"
+        while true; do
+          ask_line add_id "Deployment ID (AKfycb..., 0 = done/exit): "
+          if [[ "$add_id" == "0" || -z "$add_id" ]]; then break; fi
+          if ! valid_appscript_id "$add_id"; then
+            if [[ "$add_id" =~ ^AKfycb ]] && valid_deployment_id "$add_id"; then
+              warn "Suspiciously short ID (~70 chars expected) - may be truncated."
+              if ! ask_yes_no "Use it anyway?"; then continue; fi
+            else
+              fail "Not an Apps Script deployment ID."
+              continue
+            fi
+          fi
+          if grep -qF '"'"${add_id}"'"' "$cfgf"; then
+            warn "That ID is ALREADY in this config - skipped."
+            continue
+          fi
+          local nextlbl
+          nextlbl="$(python3 - "$cfgf" <<'GF_PY_NEXT'
+import json, sys, string
+c = json.load(open(sys.argv[1]))
+used = {k.get("account", "") for k in c.get("script_keys", [])}
+for ch in string.ascii_lowercase:
+    lbl = "acct-" + ch
+    if lbl not in used:
+        print(lbl)
+        break
+else:
+    print("acct-new")
+GF_PY_NEXT
+)" 2>/dev/null || nextlbl="acct-new"
+          ask_line add_acct "Google account label [${nextlbl}]: "
+          add_acct="${add_acct:-$nextlbl}"
+          out="$(dep_py_run "$cfgf" add "$add_id" "$add_acct" 2>/dev/null)"
+          if [[ "$out" == DUP* ]]; then
+            warn "already present - skipped."
+          elif [[ "$out" == ADDED* ]]; then
+            ok "Added. $(printf '%s' "$out" | grep -o 'count=[0-9]*')"
+          else
+            fail "Could not add (tools?) - nothing changed."
+          fi
+        done
+        dep_quota_advice "$cfgf"
+        ;;
+      3)
+        local dels
+        ask_line dels "Remove which # (e.g. 3, or 1,3 - never the last one) (0 = cancel): "
+        if [[ "$dels" == "0" || -z "$dels" ]]; then info "Cancelled."; continue; fi
+        local cleaned
+        cleaned="$(printf '%s' "$dels" | tr ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ' ')"
+        if [[ -z "$cleaned" ]]; then
+          warn "No valid numbers - nothing removed."
+          continue
+        fi
+        warn "Removing: ${cleaned// /, } (details above)"
+        if ! ask_yes_no "Proceed with removal (backup made first)?"; then continue; fi
+        local rbak="${cfgf}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -f "$cfgf" "$rbak"
+        ok "Backup made: ${rbak}"
+        out="$(dep_py_run "$cfgf" del $cleaned 2>/dev/null)"
+        case "$out" in
+          LAST*) warn "Refused: that would leave ZERO deployments (a client needs at least 1). Nothing changed." ;;
+          BADIDX*) fail "Invalid number - nothing changed." ;;
+          DELETED*) ok "Removed. $(printf '%s' "$out" | grep -o 'count=[0-9]*')" ;;
+          *) fail "Could not remove - nothing changed." ;;
+        esac
+        dep_quota_advice "$cfgf"
+        ;;
+      4)
+        local rno rnew
+        ask_line rno "Which # to rename (0 = cancel): "
+        if [[ "$rno" == "0" || -z "$rno" ]]; then info "Cancelled."; continue; fi
+        ask_line rnew "New label, e.g. acct-b: "
+        if [[ -z "$rnew" ]]; then warn "Empty label - cancelled."; continue; fi
+        cp -f "$cfgf" "${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+        out="$(dep_py_run "$cfgf" ren "$rno" "$rnew" 2>/dev/null)"
+        if [[ "$out" == RENAMED* ]]; then
+          ok "Renamed."
+        else
+          fail "Could not rename (number valid? see list) - nothing changed."
+        fi
+        ;;
+      5)
+        client_test_flow compact || true
+        pause
+        ;;
+      b|B) return 0 ;;
+      0) ok "Exit."; exit 0 ;;
+      *) warn "Invalid choice." ;;
+    esac
+  done
+}
+
 client_menu() {
   local c
   while true; do
@@ -1967,12 +2603,14 @@ client_menu() {
     menu_title "Client installation"
     printf " 1) Linux amd64 (PC)\n"
     printf " 2) Android arm64 (phone / Termux)\n"
+    printf " 3) Manage deployment IDs %s(add / remove / list - 1, 2, 3, 4...)%s\n" "$DIM" "$RESET"
     printf " b) Back\n"
     printf " 0) Exit\n\n"
     ask_line c "Choice: "
     case "$c" in
       1) client_linux_install || true; pause ;;
       2) client_android_install || true; pause ;;
+      3) deployment_manager_menu || true; pause ;;
       b|B) return 0 ;;
       0) ok "Exit."; exit 0 ;;
       *) warn "Invalid choice."; pause ;;

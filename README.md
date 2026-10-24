@@ -1,9 +1,9 @@
 # GooseRelayVPN-Installer (GooseForge)
 
-**The full installer for [GooseRelayVPN](https://github.com/Kianmhz/GooseRelayVPN)** — one script that installs, tests, diagnoses, and updates *everything*: the **VPS server**, the **Linux amd64 client**, the **Android arm64 client**, and the **Apps Script forwarder**.
+**The full installer for [GooseRelayVPN](https://github.com/Kianmhz/GooseRelayVPN)** — one script that installs, tests, diagnoses, updates, and manages *everything*: the **VPS server**, the **Linux amd64 client**, the **Android arm64 client**, and the **Apps Script forwarder**.
 
 **Author:** jackh0006 <jackh109867@gmail.com>
-**Version:** 2.0.0 — "Full installer"
+**Version:** 2.1.0 — "Smart idempotence + Deployment-ID manager"
 **License:** MIT
 
 ---
@@ -48,6 +48,25 @@ Full installation on the VPS even **packs a ready bundle** (`/root/goose-clients
 
 Every submenu has **`b` = Back** and **`0` = Exit**. Every question validates its answer and re-asks politely. Ctrl+D exits cleanly anywhere.
 
+### v2.1.0 — "Already installed?" smart detection
+
+Before touching anything, the installer now **checks what exists and reports it**, then offers a choice with a recommendation:
+
+- **Client install over existing folder** → Keep (default) / Update binary+scripts / Redo (backs up config first)
+- **Server install** → Keep (default) / Update binary only / Replace TLS parts / Full redo (warns: new key BREAKS existing clients)
+- **Apps Script** → truly idempotent: same URL = "nothing to change"; different URL = backup + overwrite
+
+### v2.1.0 — Deployment-ID manager (1, 2, 3, 4... any count)
+
+Under **Client installation → `3) Manage deployment IDs`** (also offered at the end of the Apps Script walkthrough):
+
+- Auto-finds every client config on this machine
+- Add deployment IDs (AKfycb... validated like the real client, ~70 chars) with auto-suggested account labels
+- Remove (never the last one), rename, list with masked IDs
+- Timestamped `.bak` before every change; full JSON validation after
+- Smart quota advice: same account = shared 20k/day bucket; different account = doubled quota + failover
+- Optional immediate Client test to verify the tunnel with new IDs
+
 ## What you get
 
 **Server (VPS):** `goose-server` + systemd unit + **HAProxy TLS termination** on port 8443 (backend 9444) + Let's Encrypt via certbot + UFW rules + one auto-generated 256-bit tunnel key (`/root/goose_tunnel_key.txt`). Re-running over an existing GooseForge v1 installation is safe — same state file, same managed HAProxy block.
@@ -85,6 +104,7 @@ This installer was validated by an actual horror test suite, not just by reading
 7. Apps Script `Code.gs` verified: relay URL substituted, anti-loop guard intact, real deployment ID injected
 8. server test verified remotely against a live HAProxy+TLS endpoint (HTTP 200)
 9. graceful degradation verified for every root-gated menu on a non-root machine
+10. **v2.1.0** keep/update/redo modes byte-proven; deployment manager add/remove/rename/list verified with 4 IDs; duplicate/suspicious-ID guards exercised
 
 ## Repos
 
