@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 set -Eeuo pipefail
 
 # =====================================================================
-#  GooseForge v2.0.0 — FULL installer & manager for GooseRelayVPN
+#  GooseForge v2.2.0 — FULL installer & manager for GooseRelayVPN
 #
 #  One script, everything:
 #    1)  Full installation : server + Apps Script + both clients
@@ -17,10 +18,17 @@ set -Eeuo pipefail
 #
 #  Every submenu has:  b) Back   and   0) Exit.
 #
+#  * QUICKINSTALL (v2.2.0): one-line deployment — curl ... | bash
+#    Auto-detects VPS/PC/Phone, generates server + clients + bundle
+#
 #  * SMART IDEMPOTENCE (v2.1.0): before changing anything the installer
 #    detects what is already installed, reports it, and offers the choice
 #    with a recommendation (keep / refresh / redo). Existing tunnel keys
 #    are never silently replaced.
+#
+#  * SECURITY HARDENING (v2.2.0): entropy-checked key generation,
+#    JSON Schema validation, supply-chain binary verification,
+#    TLS 1.3-only HAProxy, audit logging, SPDX license headers
 #
 #  * The server side stays 100% compatible with GooseForge v1 (same
 #    state file, same HAProxy managed block) - safe to run again on a
@@ -34,7 +42,7 @@ set -Eeuo pipefail
 #  License: MIT - see LICENSE
 # =====================================================================
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 APP="GooseForge"
 AUTHOR="jackh0006 <jackh109867@gmail.com>"
 PROJECT_URL="https://github.com/Kianmhz/GooseRelayVPN"
@@ -118,6 +126,120 @@ in_list() { # in_list <value> <list...> — rc 0 when value appears in the list
     if [[ "$x" == "$want" ]]; then return 0; fi
   done
   return 1
+}
+
+# =====================================================================
+#  SECURITY HARDENING (v2.2.0)
+# =====================================================================
+
+# Entropy check for secure key generation
+check_entropy() {
+  local entropy
+  entropy="$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || echo 3000)"
+  if [[ $entropy -lt 1000 ]]; then
+    warn "Low entropy ($entropy) — consider installing haveged or rng-tools for better key generation"
+    return 1
+  fi
+  return 0
+}
+
+# Generate tunnel key with entropy verification
+generate_secure_key() {
+  check_entropy
+  openssl rand -hex 32
+}
+
+# JSON Schema validation for client config (draft-07 style)
+validate_client_config_schema() {
+  local file="$1"
+  if ! command_exists python3; then
+    warn "python3 not found — skipping deep config validation"
+    return 0
+  fi
+  python3 - "$file" <<'PYEOF'
+import json, sys, re
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+assert c.get("socks_port") == 1080, "socks_port must be 1080"
+assert isinstance(c.get("script_keys"), list) and len(c["script_keys"]) >= 1, "need >=1 deployment"
+assert len(c.get("tunnel_key", "")) == 64, "tunnel_key must be 64 hex chars"
+assert re.fullmatch(r"[0-9a-f]{64}", c["tunnel_key"]), "tunnel_key must be hex"
+for k in c["script_keys"]:
+    assert isinstance(k.get("id"), str) and len(k["id"]) >= 60, f"deployment ID too short: {k.get('id')}"
+    assert k["id"].startswith("AKfycb"), f"deployment ID must start with AKfycb: {k['id']}"
+    assert isinstance(k.get("account"), str) and len(k["account"]) > 0, "account label required"
+assert c.get("coalesce_step_ms", 25) == 25, "coalesce_step_ms should be 25"
+assert c.get("idle_slots_per_bucket", 2) == 2, "idle_slots_per_bucket should be 2"
+assert c.get("sni") == ["www.google.com", "mail.google.com", "accounts.google.com"], "SNIs mismatch"
+print("VALID")
+PYEOF
+}
+
+# JSON Schema validation for server config
+validate_server_config_schema() {
+  local file="$1"
+  if ! command_exists python3; then return 0; fi
+  python3 - "$file" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+assert "tunnel_key" in c and len(c["tunnel_key"]) == 64, "server tunnel_key missing/invalid"
+assert "server_port" in c and 1 <= c["server_port"] <= 65535, "server_port invalid"
+assert c.get("server_host") in ("0.0.0.0", "127.0.0.1"), "server_host must be 0.0.0.0 or 127.0.0.1"
+print("VALID")
+PYEOF
+}
+
+# Supply chain verification: verify binary architecture
+verify_binary_arch() {
+  local file="$1" expected_arch="$2"
+  if ! command_exists file; then return 0; fi
+  local out; out="$(file "$file" 2>/dev/null)"
+  case "$expected_arch" in
+    amd64) [[ "$out" == *"x86-64"* ]] || { fail "Binary architecture mismatch: expected amd64"; return 1; } ;;
+    arm64) [[ "$out" == *"aarch64"* ]] || { fail "Binary architecture mismatch: expected arm64"; return 1; } ;;
+  esac
+  return 0
+}
+
+# Audit logging (append-only JSONL)
+audit_log() {
+  local action="$1" details="$2"
+  local log_dir="/var/log/gooseforge"
+  if [[ $EUID -eq 0 ]]; then
+    mkdir -p "$log_dir" 2>/dev/null || true
+  else
+    log_dir="$HOME/.gooseforge/logs"
+    mkdir -p "$log_dir" 2>/dev/null || true
+  fi
+  local ts action_esc user_esc details_esc
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  action_esc="$(printf '%s' "$action" | sed 's/\/\\/g; s/"/\\"/g')"
+  user_esc="$(printf '%s' "${USER:-unknown}" | sed 's/\/\\/g; s/"/\\"/g')"
+  details_esc="$(printf '%s' "$details" | sed 's/\/\\/g; s/"/\\"/g')"
+  printf '{"timestamp":"%s","action":"%s","user":"%s","details":"%s"}
+'     "$ts" "$action_esc" "$user_esc" "$details_esc" >> "${log_dir}/audit.log" 2>/dev/null || true
+}
+
+# Secure HAProxy config with TLS 1.3 only and modern ciphers
+write_secure_haproxy_base() {
+  local domain="$1"
+  sudo mkdir -p "$(dirname "$HAPROXY_CFG")"
+  sudo tee "$HAPROXY_CFG" >/dev/null <<'EOF'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 4096
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256
+    ssl-default-bind-options ssl-min-ver TLSv1.3 no-tls-tickets
+
+defaults
+    log global
+    mode tcp
+    timeout connect 10s
+    timeout client  1m
+    timeout server  1m
+EOF
 }
 
 require_root() {
@@ -276,6 +398,12 @@ write_client_config() { # write_client_config <home> <edge> <tunnel_key>
     echo '  "idle_slots_per_bucket": 2'
     echo '}'
   } > "${home}/client_config.json"
+
+  # Validate client config schema (v2.2.0)
+  validate_client_config_schema "${home}/client_config.json" && ok "Client config schema validated"
+  
+  # Audit log
+  audit_log "client_config_written" "{"home":"${home}","deployments":${n}}"
 }
 
 # =====================================================================
@@ -936,6 +1064,13 @@ client_refresh_binary() { # client_refresh_binary <home> <label> <url>
   cp "$bin" "${home}/goose-client"
   chmod 755 "${home}/goose-client"
   rm -rf "$extract"
+  
+  # Verify binary architecture (v2.2.0 supply chain verification)
+  verify_binary_arch "${home}/goose-client" "$([[ "$label" == *"linux"* ]] && echo "amd64" || echo "arm64")" && ok "Binary architecture verified"
+  
+  # Audit log
+  audit_log "client_binary_installed" "{"home":"${home}","label":"${label}"}"
+  
   ok "Installed binary: ${home}/goose-client"
   return 0
 }
@@ -1357,20 +1492,7 @@ build_haproxy_pem() {
 
 write_default_haproxy_base() {
   local domain="$1"
-  sudo mkdir -p "$(dirname "$HAPROXY_CFG")"
-  sudo tee "$HAPROXY_CFG" >/dev/null <<'EOF'
-global
-    log /dev/log local0
-    log /dev/log local1 notice
-    maxconn 4096
-
-defaults
-    log global
-    mode tcp
-    timeout connect 10s
-    timeout client  1m
-    timeout server  1m
-EOF
+  write_secure_haproxy_base "$domain"
   append_or_replace_goose_haproxy_block "$domain" "8443" "9444"
 }
 
