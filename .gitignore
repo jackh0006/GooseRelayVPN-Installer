@@ -1,0 +1,18 @@
+# local run artifacts
+*.log
+goose-client.log
+.dss/
+
+# client data that must never be committed (contains tunnel keys)
+client_config.json
+client_config.json.*
+.gooseforge-state
+Code.gs
+*.pem
+*_key.txt
+*key*
+
+# test sandbox
+/tmp/
+*.tmp
+*.bak*

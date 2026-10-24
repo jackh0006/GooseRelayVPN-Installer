@@ -1,159 +1,100 @@
-<p align="center">
-<img src="assets/logo.png" width="180">
-</p>
+# GooseRelayVPN-Installer (GooseForge)
 
-<h1 align="center">
-GooseRelayVPN Installer
-</h1>
+**The full installer for [GooseRelayVPN](https://github.com/Kianmhz/GooseRelayVPN)** — one script that installs, tests, diagnoses, and updates *everything*: the **VPS server**, the **Linux amd64 client**, the **Android arm64 client**, and the **Apps Script forwarder**.
 
-<p align="center">
-The Ultimate GooseRelayVPN Deployment & Management Toolkit
-</p>
-
-<p align="center">
-
-![License](https://img.shields.io/github/license/jackh0006/GooseRelayVPN-Installer)
-
-![Release](https://img.shields.io/github/v/release/jackh0006/GooseRelayVPN-Installer)
-
-![Stars](https://img.shields.io/github/stars/jackh0006/GooseRelayVPN-Installer)
-
-![Issues](https://img.shields.io/github/issues/jackh0006/GooseRelayVPN-Installer)
-
-</p>
+**Author:** jackh0006 <jackh109867@gmail.com>
+**Version:** 2.0.0 — "Full installer"
+**License:** MIT
 
 ---
 
-## Features
+## Quick start
 
-✅ One Command Installation
-
-✅ Interactive Setup Wizard
-
-✅ HAProxy Integration
-
-✅ Let's Encrypt Automation
-
-✅ Automatic TLS Configuration
-
-✅ Firewall Management
-
-✅ Port Routing
-
-✅ Health Checks
-
-✅ Service Monitoring
-
-✅ Certificate Management
-
-✅ Easy Uninstall
-
----
-
-## Installation
+On the **VPS** (Debian/Ubuntu, as root):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jackh0006/GooseRelayVPN-Installer/main/install.sh | sudo bash
+wget -O install.sh https://raw.githubusercontent.com/jackh0006/GooseRelayVPN-Installer/main/install.sh
+bash install.sh        # choose 1) Full installation — that's it
 ```
 
----
+On a **PC** (Linux amd64, no root needed):
 
-## Screenshot
+```bash
+bash install.sh        # choose 3) Client installation -> 1) Linux amd64
+```
 
-![Screenshot](assets/screenshot.png)
+On a **phone** (Termux):
 
----
+```bash
+bash install.sh        # choose 3) Client installation -> 2) Android arm64
+```
 
-## What Is GooseRelayVPN?
+Full installation on the VPS even **packs a ready bundle** (`/root/goose-clients-bundle.tgz`) with both client folders inside — pull it with `scp`, plug in Firefox or the phone, done.
 
-GooseRelayVPN is a SOCKS5 tunneling system that transports encrypted TCP traffic through Google Apps Script and forwards it to a VPS exit server.
+## The menu
 
-This project provides the easiest way to deploy and manage GooseRelayVPN servers.
+```
+ 1) Full installation (server + Apps Script + clients)
+ 2) Server installation (VPS - Linux amd64)
+ 3) Client installation (Linux amd64 + Android arm64)
+ 4) Apps Script helper (workable Code.gs + 5 steps)
+ 5) Test (server test / client test)
+ 6) Doctor (one-key diagnosis)
+ 7) IPv4-only helper (VPS fix for dead IPv6)
+ 8) Status & health
+ 9) Advanced (HAProxy / TLS / ports / update)
+10) Uninstall (server / client)
+```
 
----
+Every submenu has **`b` = Back** and **`0` = Exit**. Every question validates its answer and re-asks politely. Ctrl+D exits cleanly anywhere.
 
-## Why This Project?
+## What you get
 
-Deploying GooseRelayVPN manually can be time consuming.
+**Server (VPS):** `goose-server` + systemd unit + **HAProxy TLS termination** on port 8443 (backend 9444) + Let's Encrypt via certbot + UFW rules + one auto-generated 256-bit tunnel key (`/root/goose_tunnel_key.txt`). Re-running over an existing GooseForge v1 installation is safe — same state file, same managed HAProxy block.
 
-This installer automates:
+**Clients (PC + phone):** official binaries from upstream releases into **one self-contained folder** (`~/goose`, `~/goose-android`): binary + tuned `client_config.json` + `start-goose.sh` + `stop-goose.sh` + `GUIDE.txt`. No root, no system files, ever.
 
-- VPS preparation
-- HAProxy setup
-- TLS certificates
-- Firewall configuration
-- Service management
-- Health monitoring
+**The tuned client config is field-proven on a hostile hotspot:**
 
----
+- `google_host` — the fastest of the 4 known Google edge IPs, **auto-tested live** during install
+- `coalesce_step_ms: 25` — outgoing bursts bundle into fewer Apps Script calls (more speed, more quota headroom)
+- `idle_slots_per_bucket: 2` — required minimum for single-deployment download throughput
+- 3 SNIs (`www.google.com`, `mail.google.com`, `accounts.google.com`)
+- AES-256-GCM end-to-end; Google's fronting edge never sees the key
 
-## Documentation
+**`start-goose.sh` guards the #1 real-world mistake:** if a v2rayN/sing-box **TUN mode** is capturing all traffic (double-tunneling causes the infamous connection resets), the script refuses to start, walks you through the 10-second fix, and re-checks on ENTER. Termux-safe (`ip`/`ss`/`pgrep` checks degrade gracefully where those tools don't exist).
 
-- Architecture
-- FAQ
-- Troubleshooting
-- Comparison Guide
+**Apps Script helper (menu 4):** writes the official `Code.gs` forwarder with **your relay URL already substituted**, prints the 5-step deployment walkthrough (Execute as: Me / Who has access: Anyone), and can add the resulting deployment ID straight into your client configs with an automatic backup.
 
----
+**Test (menu 5):** *Server test* — deep checks (services, HAProxy, certificate expiry countdown, key permissions, backend + public endpoint). *Client test* — config JSON validation, binary checks, live SOCKS5 tunnel check with your exit IP.
 
-## Roadmap
+**Doctor (menu 6):** one keypress: internet → Google edge speed table → client health → VPS seen *from here* → ranked remedies. Built from the three most common real-world failures.
 
-- Docker Support
-- Auto Updates
-- Monitoring Dashboard
-- Multi Server Support
-- Kubernetes Support
+**IPv4-only helper (menu 7):** fixes providers (OVH etc.) whose advertised IPv6 is dead — previously hundreds of failed dials until the fix was applied live. Idempotent, reversible (`sudo rm /etc/sysctl.d/99-gooserelay-ipv4-only.conf`).
 
----
+## Testing story
 
-## Donate and Support
+This installer was validated by an actual horror test suite, not just by reading it:
 
-If this project saves you time please consider supporting its development.
-All donations go toward server costs and keeping this project free and open source.
+1. `bash -n` + full piped-input runs of every menu and wrong-answer path
+2. **real downloads** of both client archives (amd64 + arm64) inside a sandbox, producing complete folders
+3. produced `start-goose.sh` / `stop-goose.sh` verified **byte-identical** to the live, field-proven versions
+4. generated configs parsed and asserted (ports, tuned values, key lengths, SNIs)
+5. the arm64 binary verified as `ELF 64-bit LSB pie executable, ARM aarch64`
+6. the installed client **actually booted**: `pre-flight OK` → `ready: local SOCKS5 is listening` → live fetch through the tunnel returned the VPS exit IP, HTTP 200
+7. Apps Script `Code.gs` verified: relay URL substituted, anti-loop guard intact, real deployment ID injected
+8. server test verified remotely against a live HAProxy+TLS endpoint (HTTP 200)
+9. graceful degradation verified for every root-gated menu on a non-root machine
 
-  Bitcoin:
-  bc1q8t0fn2yrsy4lh3m0pz34uj27t8vxjeavkjym83
-  
-  DOGE:
-  D6ZdMQ7mHGGmuH9prpZ2zjpnG5Q3WVRDtC
-  
-  Ethereum:
-  0xdad428900a4359be8f76b3062df34211582e09eb
-  
-  USDT (ERC20):
-  0xdad428900a4359be8f76b3062df34211582e09eb
-  
-  TRX:
-  TMpb6RNTuGNM1eTakm9kjds1mRTPYYJesf
-  
-  USDT (TRC20):
-  TMpb6RNTuGNM1eTakm9kjds1mRTPYYJesf
-  
-  BNB:
-  0xdad428900a4359be8f76b3062df34211582e09eb
-  
-  USDT (BEP20):
-  0xdad428900a4359be8f76b3062df34211582e09eb
-  
-  SOL:
-  BDCCrRez1yD1RpkAtiqKKDk3BfxPD8P7nkL26jCYrzgL
-  
-  USDT (SPL):
-  BDCCrRez1yD1RpkAtiqKKDk3BfxPD8P7nkL26jCYrzgL
-  
-  USDC (SPL):
-  BDCCrRez1yD1RpkAtiqKKDk3BfxPD8P7nkL26jCYrzgL
-  
-  XRP:
-  rNUAhaATFLvosdu9m9M95bupRBtZ8eqpj9
-  
-  TON:
-  UQCu6-3yGyQ5dzvcCxr2gobuvx5ddbS9EC690qtey92P5_wX
-  
-  LTC:
-  ltc1q2gs89cfy3mumr7gu9w0zl9rllf80q67m5rmma8
+## Repos
 
+- This installer: <https://github.com/jackh0006/GooseRelayVPN-Installer>
+- The VPN itself (server/client releases + Apps Script source): <https://github.com/Kianmhz/GooseRelayVPN>
+
+## Security
+
+The tunnel key (64 hex chars) is the entire access credential — treat `client_config.json` like a password. The Apps Script is a dumb encrypted pipe; it never sees plaintext. See `GUIDE.txt` (written into every client folder) for the short security checklist, and `SECURITY.md` for reporting.
 
 ## License
 
-MIT
+MIT — © 2026 jackh0006 <jackh109867@gmail.com>. See `LICENSE`.
